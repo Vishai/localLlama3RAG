@@ -4,43 +4,87 @@ import psycopg
 import ast
 from psycopg.rows import dict_row
 from tqdm import tqdm
-from colorama import Fore, init
-import sys
-import requests
-from bs4 import BeautifulSoup
-
-# Initialize colorama for cross-platform colored output
-init()
+from colorama import Fore
 
 client = chromadb.Client()
 system_prompt = (
-    'You are an AI assistant for an e-commerce agency managing Amazon sellers. '
-    'You have access to client information, store performance, product data, and case histories. '
-    'Provide insightful answers and recommendations based on this data.'
+    'You are an AI assistant that has memory of every conversation you have ever had with this user. '
+    'On every prompt from the user, the system has checked for any relevant messages you have had with the user. '
+    'If any embedded previous conversations are attached, use them for context to responding to the user, '
+    'if the context is relevant and useful to responding. If the recalled conversations are irrelevant, '
+    'disregard speaking about them and respond normally as an AI assistant. Do not talk about recalling conversations. '
+    'Just use any useful data from the previous conversations and respond normally as an intelligent AI assistant.'
 )
 convo = [{'role': 'system', 'content': system_prompt}]
 
 DB_PARAMS = {
     'dbname': 'memory_agent',
-    'user': 'Vishai',
+    'user': 'vishai',
     'password': 'BJKPEa090!',
     'host': 'localhost',
     'port': '5432'
 }
 
 def connect_db():
-    conn = psycopg.connect(**DB_PARAMS)
-    return conn
+    try:
+        # print("Attempting to connect with these parameters:")
+        # for key, value in DB_PARAMS.items():
+        #     if key != 'password':
+        #         print(f"{key}: {value}")
+        #     else:
+        #         print("password: [REDACTED]")
+        
+        conn = psycopg.connect(**DB_PARAMS)
+        print(f"Successfully connected to database: {conn.info.dbname} on {conn.info.host}")
+        print(f"Connected as user: {conn.info.user}")
+        return conn
+    except Exception as e:
+        print(f"Failed to connect to database. Error: {e}")
+        return None
+
+def test_db_connection():
+    try:
+        conn = connect_db()
+        if conn:
+            print("Database connection successful.")
+            conn.close()
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+
+def check_postgres_db():
+    postgres_params = DB_PARAMS.copy()
+    postgres_params['dbname'] = 'postgres'
+    postgres_params['user'] = 'postgres'
+    try:
+        conn = psycopg.connect(**postgres_params)
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT datname FROM pg_database WHERE datistemplate = false;")
+            databases = cursor.fetchall()
+            print("Databases in postgres:")
+            for db in databases:
+                print(f"- {db[0]}")
+            
+            if 'memory_agent' in [db[0] for db in databases]:
+                cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_catalog = 'memory_agent';")
+                tables = cursor.fetchall()
+                print("Tables in memory_agent database:")
+                for table in tables:
+                    print(f"- {table[0]}")
+        conn.close()
+    except Exception as e:
+        print(f"Failed to connect to postgres database. Error: {e}")
 
 def fetch_conversations():
-    conn = connect_db()
     try:
+        conn = connect_db()
         with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute('SELECT * FROM conversations')
             conversations = cursor.fetchall()
-    finally:
         conn.close()
-    return conversations
+        return conversations
+    except Exception as e:
+        print(f"Error fetching conversations: {e}")
+        return []
 
 def create_vector_db(conversations):
     vector_db_name = "conversations"
@@ -73,6 +117,10 @@ def create_queries(prompt):
     )
     query_convo = [
         {'role': 'system', 'content': query_msg},
+        {'role': 'user', 'content': 'Write an email to my car insurance company and create a pursuasive request for them to lower my monthly rate.'},
+        {'role': 'assistant', 'content': '["What is the users name?", "What is the users current auto insurance provider?", "What is the monthly rate the user currently pays for auto insurance?"]'},
+        {'role': 'user', 'content': 'how can i convert the speak function in my llama3 python voice assistant to use pyttsx3 instead of the openai tts api?'},
+        {'role': 'assistant', 'content': '["Llama3 voice assistant", "Python voice assistant", "OpenAI TTS", "openai speak"]'},
         {'role': 'user', 'content': prompt}
     ]
     
@@ -94,15 +142,18 @@ def classify_embedding(query, context):
     )
     classify_convo = [
         {'role': 'system', 'content': classify_msg},
+        {'role': 'user', 'content': f'SEARCH QUERY: What is the users name? \n\nEMBEDDED CONTEXT: You are Ai Austin. How can I help today Austin?'},
+        {'role': 'assistant', 'content': 'yes'},
+        {'role': 'user', 'content': f'SEARCH QUERY: Llama3 Python Voice Assistant \n\nEMBEDDED CONTEXT: Siri is a voice assistant on Apple iOS and Mac OS. The voice assistant is designed to take voice prompts and help the user complete simple tasks on the device.'},
+        {'role': 'assistant', 'content': 'no'},
         {'role': 'user', 'content': f'SEARCH QUERY: {query} \n\nEMBEDDED CONTEXT: {context}'}
     ]
     
     response = ollama.chat(model='llama3', messages=classify_convo)
-    result = response['message']['content'].strip().lower()
-    print(f"Classification for query '{query}': {result}")
-    return result
+    
+    return response['message']['content'].strip().lower()
 
-def retrieve_embeddings(queries, results_per_query=2):
+def retrieve_embeddings(queries, results_per_query=2, confidence_threshold=0.8):
     embeddings = set()
     
     for query in tqdm(queries, desc="Processing queries to vector database"):
@@ -111,42 +162,64 @@ def retrieve_embeddings(queries, results_per_query=2):
 
         collection = client.get_collection(name='conversations')
         results = collection.query(query_embeddings=[query_embedding], n_results=results_per_query)
-        
-        if not results['documents']:
-            continue
-        
         best_embeddings = results['documents'][0]
+        distances = results['distances'][0]
         
-        for best in best_embeddings:
-            if 'yes' in classify_embedding(query=query, context=best) and best not in embeddings:
+        for best, distance in zip(best_embeddings, distances):
+            confidence = 1 - distance  # Assuming distance is normalized between 0 and 1
+            if confidence >= confidence_threshold and 'yes' in classify_embedding(query=query, context=best) and best not in embeddings:
                 embeddings.add(best)
                 
     return embeddings
 
-def store_conversation(prompt, response=None):
-    conn = connect_db()
+def store_conversation(prompt, response):
     try:
+        conn = connect_db()
+        if conn is None:
+            print("Failed to connect to database. Cannot store conversation.")
+            return
         with conn.cursor() as cursor:
-            cursor.execute(
-                'INSERT INTO conversations (timestamp, prompt, response) VALUES (CURRENT_TIMESTAMP, %s, %s)',
-                (prompt, response if response else "User memorized information")
-            )
-            conn.commit()
+            cursor.execute('INSERT INTO conversations (timestamp, prompt, response) VALUES (CURRENT_TIMESTAMP, %s, %s) RETURNING id', (prompt, response))
+            new_id = cursor.fetchone()[0]
+        conn.commit()
+        print(f"Conversation stored successfully with ID: {new_id}")
+    except Exception as e:
+        print(f"Error storing conversation: {e}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 def remove_last_conversation():
-    conn = connect_db()
     try:
+        conn = connect_db()
         with conn.cursor() as cursor:
             cursor.execute('DELETE FROM conversations WHERE id = (SELECT MAX(id) FROM conversations)')
-            conn.commit()
+        conn.commit()
+        print("Last conversation removed successfully.")
+    except Exception as e:
+        print(f"Error removing last conversation: {e}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 def stream_response(prompt):
-    convo.append({'role': 'user', 'content': prompt})
-    stream = ollama.chat(model='llama3', messages=convo, stream=True)
+    # Always try to retrieve relevant information
+    queries = create_queries(prompt)
+    embeddings = retrieve_embeddings(queries)
+    
+    if embeddings:
+        relevant_info = f"Retrieved information: {embeddings}\n\n"
+        system_message = f"Use the following retrieved information to inform your response. If the information is not relevant or sufficient, state that you don't have enough information to answer accurately: {relevant_info}"
+    else:
+        system_message = "You don't have any specific information about this query. If you can't answer accurately, please state that you don't have enough information."
+
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        {'role': 'system', 'content': system_message},
+        {'role': 'user', 'content': prompt}
+    ]
+
+    stream = ollama.chat(model='llama3', messages=messages, stream=True)
     response = ''
     print(Fore.LIGHTGREEN_EX + '\nASSISTANT:')
     
@@ -165,177 +238,91 @@ def recall(prompt):
     convo.append({'role': 'user', 'content': f'MEMORIES: {embeddings} \n\n USER PROMPT: {prompt}'})
     print(Fore.YELLOW + f'\n{len(embeddings)} message:response embeddings added for context.')
 
-def web_search(query):
-    # This is a simplified web search function. In practice, you'd use a more robust solution.
-    url = f"https://www.google.com/search?q={query}"
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    results = soup.find_all('div', class_='g')
-    return [result.text for result in results[:3]]
-
-def get_similar_cases(case_type, description):
-    conn = connect_db()
+def view_recent_conversations(limit=5):
     try:
+        conn = connect_db()
+        print(f"Connected to database: {conn.info.dbname} on {conn.info.host}")
         with conn.cursor(row_factory=dict_row) as cursor:
-            cursor.execute('''
-                SELECT c.*, cr.resolution_steps, cr.outcome
-                FROM cases c
-                LEFT JOIN case_resolutions cr ON c.id = cr.case_id
-                WHERE c.case_type = %s AND c.status = 'Resolved'
-                ORDER BY similarity(c.description, %s) DESC
-                LIMIT 3
-            ''', (case_type, description))
-            similar_cases = cursor.fetchall()
+            cursor.execute('SELECT * FROM conversations ORDER BY timestamp DESC LIMIT %s', (limit,))
+            conversations = cursor.fetchall()
+        print(f"Retrieved {len(conversations)} conversations")
+        for conv in conversations:
+            print(f"ID: {conv['id']}, Timestamp: {conv['timestamp']}")
+            print(f"Prompt: {conv['prompt']}")
+            print(f"Response: {conv['response']}")
+            print("-" * 50)
+    except Exception as e:
+        print(f"Error viewing conversations: {e}")
     finally:
-        conn.close()
-    return similar_cases
+        if conn:
+            conn.close()
 
-def formulate_resolution_steps(case_type, description):
-    similar_cases = get_similar_cases(case_type, description)
-    web_results = web_search(f"Amazon seller {case_type} resolution")
-    
-    context = f"Case Type: {case_type}\nDescription: {description}\n\n"
-    context += "Similar Resolved Cases:\n"
-    for case in similar_cases:
-        context += f"- {case['title']}: {case['resolution_steps']}\n"
-    context += "\nWeb Search Results:\n"
-    for result in web_results:
-        context += f"- {result}\n"
-    
-    prompt = f"{context}\n\nBased on the above information, provide a step-by-step resolution plan for this case."
-    
-    response = ollama.chat(model='llama3', messages=[
-        {'role': 'system', 'content': system_prompt},
-        {'role': 'user', 'content': prompt}
-    ])
-    
-    return response['message']['content']
-
-def create_case(client_id, store_id, case_type, priority, title, description):
-    conn = connect_db()
+def show_table_structure():
     try:
+        conn = connect_db()
+        print(f"Connected to database: {conn.info.dbname} on {conn.info.host}")
         with conn.cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO cases (client_id, store_id, case_type, status, priority, title, description)
-                VALUES (%s, %s, %s, 'Open', %s, %s, %s)
-                RETURNING id
-            ''', (client_id, store_id, case_type, priority, title, description))
-            case_id = cursor.fetchone()[0]
-        conn.commit()
+            cursor.execute("""
+                SELECT column_name, data_type 
+                FROM information_schema.columns
+                WHERE table_name = 'conversations'
+            """)
+            columns = cursor.fetchall()
+            print("Table structure for 'conversations':")
+            for column in columns:
+                print(f"{column[0]}: {column[1]}")
+            
+            cursor.execute("SELECT COUNT(*) FROM conversations")
+            count = cursor.fetchone()[0]
+            print(f"\nTotal number of rows in 'conversations': {count}")
+    except Exception as e:
+        print(f"Error showing table structure: {e}")
     finally:
-        conn.close()
-    return case_id
-
-def update_case(case_id, update_type, description):
-    conn = connect_db()
+        if conn:
+            conn.close()
+            
+def check_db_details():
     try:
+        conn = connect_db()
         with conn.cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO case_updates (case_id, update_type, description)
-                VALUES (%s, %s, %s)
-            ''', (case_id, update_type, description))
-            cursor.execute('UPDATE cases SET updated_at = CURRENT_TIMESTAMP WHERE id = %s', (case_id,))
-        conn.commit()
-    finally:
+            cursor.execute("SELECT current_database(), current_schema(), current_user")
+            db, schema, user = cursor.fetchone()
+            print(f"Current database: {db}")
+            print(f"Current schema: {schema}")
+            print(f"Current user: {user}")
+            
+            cursor.execute("SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema != 'pg_catalog' AND table_schema != 'information_schema'")
+            tables = cursor.fetchall()
+            print("Tables in current database:")
+            for schema, table in tables:
+                print(f"- {schema}.{table}")
         conn.close()
-        
-        def resolve_case(case_id, resolution_steps, outcome):
-    conn = connect_db()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO case_resolutions (case_id, resolution_steps, outcome)
-                VALUES (%s, %s, %s)
-            ''', (case_id, resolution_steps, outcome))
-            cursor.execute('UPDATE cases SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s', ('Resolved', case_id))
-        conn.commit()
-    finally:
-        conn.close()
+    except Exception as e:
+        print(f"Error checking database details: {e}")
 
-def handle_case_query(prompt, client_id=None):
-    if "create case" in prompt.lower():
-        case_details = prompt.split(",")
-        case_id = create_case(client_id, case_details[0], case_details[1], case_details[2], case_details[3], case_details[4])
-        return f"Case created with ID: {case_id}"
-    
-    elif "update case" in prompt.lower():
-        update_details = prompt.split(",")
-        update_case(update_details[0], update_details[1], update_details[2])
-        return "Case updated successfully"
-    
-    elif "resolve case" in prompt.lower():
-        resolution_details = prompt.split(",")
-        resolve_case(resolution_details[0], resolution_details[1], resolution_details[2])
-        return "Case resolved successfully"
-    
-    elif "suggest resolution" in prompt.lower():
-        case_details = prompt.split(",")
-        resolution_steps = formulate_resolution_steps(case_details[0], case_details[1])
-        return f"Suggested Resolution Steps:\n{resolution_steps}"
-    
-    else:
-        return stream_response(prompt)
-
-def print_feedback(message, color=Fore.YELLOW):
-    print(f"\n{color}{message}{Fore.RESET}")
-
-def handle_command(command, content):
-    if command == '/memorize':
-        try:
-            store_conversation(prompt=content, response='Memory stored.')
-            print_feedback("Memory successfully stored.")
-        except Exception as e:
-            print_feedback(f"Error storing memory: {str(e)}", Fore.RED)
-    elif command == '/recall':
-        try:
-            recall(prompt=content)
-            stream_response(prompt=content)
-        except Exception as e:
-            print_feedback(f"Error recalling memory: {str(e)}", Fore.RED)
-    elif command == '/forget':
-        try:
-            remove_last_conversation()
-            convo.pop()  # Remove the last user message
-            if convo[-1]['role'] == 'assistant':
-                convo.pop()  # Remove the last assistant message if present
-            print_feedback("Last conversation removed from memory.")
-        except Exception as e:
-            print_feedback(f"Error removing last conversation: {str(e)}", Fore.RED)
-    else:
-        print_feedback(f"Unknown command: {command}", Fore.RED)
-
-def main():
-    print_feedback("Welcome to your AI assistant. Type '/help' for available commands.")
-    
+# Main execution
+if __name__ == "__main__":
+    test_db_connection()
+    check_postgres_db()
     conversations = fetch_conversations()
     create_vector_db(conversations)
-    
-    while True:
-        try:
-            user_input = input(Fore.WHITE + 'USER: \n')
-            
-            if user_input.lower() == '/exit':
-                print_feedback("Goodbye!")
-                sys.exit(0)
-            
-            if user_input.lower() == '/help':
-                print_feedback("Available commands:\n"
-                               "/memorize [content]: Store a new memory\n"
-                               "/recall [query]: Recall and respond based on stored memories\n"
-                               "/forget: Remove the last stored conversation\n"
-                               "/exit: Exit the program")
-                continue
-            
-            if user_input.startswith('/'):
-                parts = user_input.split(maxsplit=1)
-                command = parts[0].lower()
-                content = parts[1] if len(parts) > 1 else ""
-                handle_command(command, content)
-            else:
-                handle_case_query(user_input)
-                
-        except Exception as e:
-            print_feedback(f"An error occurred: {str(e)}", Fore.RED)
 
-if __name__ == "__main__":
-    main()
+    while True:
+        prompt = input(Fore.WHITE + 'USER: \n')
+        
+        if prompt[:7].lower() == '/recall':
+            recall(prompt = prompt[7:].strip())
+            stream_response(prompt=prompt[7:].strip())
+        elif prompt[:9].lower() == '/memorize':
+            store_conversation(prompt = prompt[9:].strip(), response='Memory stored.')
+            print('\n')
+        elif prompt[:7].lower() == '/forget':
+            remove_last_conversation()
+            convo = convo[:-2]
+            print('\n')
+        elif prompt[:5].lower() == '/view':
+            view_recent_conversations()
+        elif prompt[:10].lower() == '/structure':
+            show_table_structure()
+        else:
+            stream_response(prompt=prompt)
