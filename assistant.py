@@ -34,10 +34,12 @@ def connect_db():
 
 def fetch_conversations():
     conn = connect_db()
-    with conn.cursor(row_factory=dict_row) as cursor:
-        cursor.execute('SELECT * FROM conversations')
-        conversations = cursor.fetchall()
-    conn.close()
+    try:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute('SELECT * FROM conversations')
+            conversations = cursor.fetchall()
+    finally:
+        conn.close()
     return conversations
 
 def create_vector_db(conversations):
@@ -109,6 +111,10 @@ def retrieve_embeddings(queries, results_per_query=2):
 
         collection = client.get_collection(name='conversations')
         results = collection.query(query_embeddings=[query_embedding], n_results=results_per_query)
+        
+        if not results['documents']:
+            continue
+        
         best_embeddings = results['documents'][0]
         
         for best in best_embeddings:
@@ -119,20 +125,24 @@ def retrieve_embeddings(queries, results_per_query=2):
 
 def store_conversation(prompt, response=None):
     conn = connect_db()
-    with conn.cursor() as cursor:
-        cursor.execute(
-            'INSERT INTO conversations (timestamp, prompt, response) VALUES (CURRENT_TIMESTAMP, %s, %s)',
-            (prompt, response if response else "User memorized information")
-        )
-        conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'INSERT INTO conversations (timestamp, prompt, response) VALUES (CURRENT_TIMESTAMP, %s, %s)',
+                (prompt, response if response else "User memorized information")
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
 def remove_last_conversation():
     conn = connect_db()
-    with conn.cursor() as cursor:
-        cursor.execute('DELETE FROM conversations WHERE id = (SELECT MAX(id) FROM conversations)')
-        conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('DELETE FROM conversations WHERE id = (SELECT MAX(id) FROM conversations)')
+            conn.commit()
+    finally:
+        conn.close()
 
 def stream_response(prompt):
     convo.append({'role': 'user', 'content': prompt})
@@ -165,17 +175,19 @@ def web_search(query):
 
 def get_similar_cases(case_type, description):
     conn = connect_db()
-    with conn.cursor(row_factory=dict_row) as cursor:
-        cursor.execute('''
-            SELECT c.*, cr.resolution_steps, cr.outcome
-            FROM cases c
-            LEFT JOIN case_resolutions cr ON c.id = cr.case_id
-            WHERE c.case_type = %s AND c.status = 'Resolved'
-            ORDER BY similarity(c.description, %s) DESC
-            LIMIT 3
-        ''', (case_type, description))
-        similar_cases = cursor.fetchall()
-    conn.close()
+    try:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute('''
+                SELECT c.*, cr.resolution_steps, cr.outcome
+                FROM cases c
+                LEFT JOIN case_resolutions cr ON c.id = cr.case_id
+                WHERE c.case_type = %s AND c.status = 'Resolved'
+                ORDER BY similarity(c.description, %s) DESC
+                LIMIT 3
+            ''', (case_type, description))
+            similar_cases = cursor.fetchall()
+    finally:
+        conn.close()
     return similar_cases
 
 def formulate_resolution_steps(case_type, description):
@@ -201,38 +213,44 @@ def formulate_resolution_steps(case_type, description):
 
 def create_case(client_id, store_id, case_type, priority, title, description):
     conn = connect_db()
-    with conn.cursor() as cursor:
-        cursor.execute('''
-            INSERT INTO cases (client_id, store_id, case_type, status, priority, title, description)
-            VALUES (%s, %s, %s, 'Open', %s, %s, %s)
-            RETURNING id
-        ''', (client_id, store_id, case_type, priority, title, description))
-        case_id = cursor.fetchone()[0]
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO cases (client_id, store_id, case_type, status, priority, title, description)
+                VALUES (%s, %s, %s, 'Open', %s, %s, %s)
+                RETURNING id
+            ''', (client_id, store_id, case_type, priority, title, description))
+            case_id = cursor.fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
     return case_id
 
 def update_case(case_id, update_type, description):
     conn = connect_db()
-    with conn.cursor() as cursor:
-        cursor.execute('''
-            INSERT INTO case_updates (case_id, update_type, description)
-            VALUES (%s, %s, %s)
-        ''', (case_id, update_type, description))
-        cursor.execute('UPDATE cases SET updated_at = CURRENT_TIMESTAMP WHERE id = %s', (case_id,))
-    conn.commit()
-    conn.close()
-
-def resolve_case(case_id, resolution_steps, outcome):
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO case_updates (case_id, update_type, description)
+                VALUES (%s, %s, %s)
+            ''', (case_id, update_type, description))
+            cursor.execute('UPDATE cases SET updated_at = CURRENT_TIMESTAMP WHERE id = %s', (case_id,))
+        conn.commit()
+    finally:
+        conn.close()
+        
+        def resolve_case(case_id, resolution_steps, outcome):
     conn = connect_db()
-    with conn.cursor() as cursor:
-        cursor.execute('''
-            INSERT INTO case_resolutions (case_id, resolution_steps, outcome)
-            VALUES (%s, %s, %s)
-        ''', (case_id, resolution_steps, outcome))
-        cursor.execute('UPDATE cases SET status = 'Resolved', updated_at = CURRENT_TIMESTAMP WHERE id = %s', (case_id,))
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                INSERT INTO case_resolutions (case_id, resolution_steps, outcome)
+                VALUES (%s, %s, %s)
+            ''', (case_id, resolution_steps, outcome))
+            cursor.execute('UPDATE cases SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s', ('Resolved', case_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 def handle_case_query(prompt, client_id=None):
     if "create case" in prompt.lower():
