@@ -22,8 +22,8 @@ convo = [{'role': 'system', 'content': system_prompt}]
 
 DB_PARAMS = {
     'dbname': 'memory_agent',
-    'user': 'your_username',
-    'password': 'your_password',
+    'user': 'Vishai',
+    'password': 'BJKPEa090!',
     'host': 'localhost',
     'port': '5432'
 }
